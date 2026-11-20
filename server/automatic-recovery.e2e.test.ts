@@ -18,14 +18,14 @@ const CATALOG_PROBE_FOLDER = ["", "providers", "opencode", "discovery"].join(sep
 const turnCalls = (path: string) => jsonLines(path).filter((call) => !String(call.cwd ?? "").endsWith(CATALOG_PROBE_FOLDER));
 
 async function withRecoveryFixture(
-  options: { enabled?: boolean; method?: string; error?: unknown; afterOutput?: boolean; backupFails?: boolean; gated?: boolean; scripted?: boolean; codexBackup?: boolean; claudes?: Record<string, Record<string, string>>; missingCli?: string },
+  options: { enabled?: boolean; method?: string; error?: unknown; afterOutput?: boolean; backupFails?: boolean; gated?: boolean; scripted?: boolean; codexBackup?: boolean; claudes?: Record<string, Record<string, string>>; missingCli?: string; claudeLimit?: boolean },
   check: (fixture: {
     api: (method: string, path: string, body?: unknown, expectedStatus?: number) => Promise<any>;
     control: (...args: string[]) => Promise<any>;
     calls: () => Array<{ pid: number; method: string }>;
     backupPrompts: () => any[];
     backupReceipt: () => { argv: string[]; prompt: unknown; systemPrompt: string };
-    dataDir: string; failureFile: string; gateFile: string; evidence: unknown[];
+    dataDir: string; failureFile: string; gateFile: string; limitedFile: string; evidence: unknown[];
   }) => Promise<void>,
 ) {
   const fixture = await launchVerificationServer({}, undefined, undefined, undefined, undefined,
@@ -33,6 +33,7 @@ async function withRecoveryFixture(
   const { dataDir, url, logPath } = fixture.info;
   const failureFile = join(dataDir, "startup-failure.json");
   const gateFile = join(dataDir, "startup-release");
+  const limitedFile = join(dataDir, "claude-limited.json");
   const rpcFile = join(dataDir, "primary-rpc.jsonl");
   const backupFile = join(dataDir, "backup-prompts.jsonl");
   const evidence: unknown[] = [{ url, options }];
@@ -79,6 +80,7 @@ async function withRecoveryFixture(
       ...config.instances.claude.environment,
       FAKE_CLAUDE_PROMPTS: backupFile, FAKE_CLAUDE_TOOL_CALLS: "[]",
       FAKE_CLAUDE_MODE: options.backupFails ? "not-logged-in" : "happy",
+      ...(options.claudeLimit ? { FAKE_CLAUDE_LIMITED_FILE: limitedFile } : {}),
     };
     for (const [id, environment] of Object.entries(options.claudes ?? {})) config.instances[id] = {
       ...config.instances.claude, displayName: `${id} fixture`, environment: { ...config.instances.claude.environment, ...environment },
@@ -117,7 +119,7 @@ async function withRecoveryFixture(
         const { argv, prompt, systemPrompt } = JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8"));
         return { argv, prompt, systemPrompt };
       },
-      dataDir, failureFile, gateFile, evidence,
+      dataDir, failureFile, gateFile, limitedFile, evidence,
     });
   } finally {
     evidence.push({ calls: jsonLines(rpcFile), backupPrompts: jsonLines(backupFile) });
@@ -476,6 +478,51 @@ it("moves past a backup whose model is no longer offered to the next one in orde
     expect(backupPrompts()).toHaveLength(1);
     expect(messages.some((message: any) => message.tool?.ok === false)).toBe(false);
     expect(after.tasks.find((task: any) => task.threadId === threadId)).toMatchObject({ modelSelection: backup, busy: false });
+  });
+}, 90_000);
+
+it("still contacts the last backup when it has a cached usage hold that has since cleared", async () => {
+  await withRecoveryFixture({ claudeLimit: true }, async ({ api, control, calls, backupPrompts, limitedFile, evidence }) => {
+    writeFileSync(limitedFile, "{}");
+    const { bot: earlier } = await control("new-bot", "--name", "Meets the limit first");
+    await api("PATCH", `/api/bots/${earlier.id}/tasks/${earlier.activeTaskId}`, { modelSelection: backup, updateBotDefault: true });
+    await control("send", "--bot", earlier.id, "--task", earlier.activeTaskId, "--text", "HIT_THE_LIMIT_1H");
+    expect((await control("wait", "--bot", earlier.id, "--task", earlier.activeTaskId, "--timeout", "30")).status).toBe("failed");
+    rmSync(limitedFile);
+    const { bot } = await control("new-bot", "--name", "Last backup held");
+    const threadId = bot.activeTaskId;
+    await api("PATCH", `/api/bots/${bot.id}/tasks/${threadId}`, { modelSelection: primary, updateBotDefault: true });
+    await api("PATCH", `/api/bots/${bot.id}`, { fallback: [{ instanceId: "secondary", model: primary.model }, backup] });
+    const text = "REACH_THE_HELD_BACKUP_4C";
+    await control("send", "--bot", bot.id, "--task", threadId, "--text", text);
+    const wait = await control("wait", "--bot", bot.id, "--task", threadId, "--timeout", "30");
+    const { messages } = await api("GET", `/api/threads/${threadId}/messages?limit=100`);
+    evidence.push({ wait, messages });
+    expect(wait.status).toBe("settled");
+    expect(calls().filter((call) => call.method === "initialize.error")).toHaveLength(2);
+    expect(backupPrompts().filter((prompt) => JSON.stringify(prompt).includes(text))).toHaveLength(1);
+    expect(messages.findLast((message: any) => message.role === "bot" && message.kind === "text"))
+      .toMatchObject({ text: "hello from fake claude", turnSucceeded: true });
+  });
+}, 90_000);
+
+it("keeps a limit's failover through a startup hop, so the thread still goes back to the limited AI", async () => {
+  await withRecoveryFixture({ claudeLimit: true, codexBackup: true }, async ({ api, control, calls, dataDir, limitedFile, evidence }) => {
+    writeFileSync(limitedFile, "{}");
+    const healthy = { instanceId: "codex", model: "gpt-fake-default" };
+    const { bot } = await control("new-bot", "--name", "Limit then startup hop");
+    const threadId = bot.activeTaskId;
+    await api("PATCH", `/api/bots/${bot.id}/tasks/${threadId}`, { modelSelection: backup, updateBotDefault: true, approvalMode: "ask" });
+    await api("PATCH", `/api/bots/${bot.id}`, { fallback: [{ instanceId: "secondary", model: primary.model }, healthy] });
+    await control("send", "--bot", bot.id, "--task", threadId, "--text", "LIMIT_THEN_HOP_9R");
+    const wait = await control("wait", "--bot", bot.id, "--task", threadId, "--timeout", "30");
+    const { messages } = await api("GET", `/api/threads/${threadId}/messages?limit=100`);
+    const failovers = JSON.parse(readFileSync(join(dataDir, "limit-failovers.json"), "utf8"));
+    evidence.push({ wait, messages, failovers });
+    expect(wait.status).toBe("settled");
+    expect(calls().filter((call) => call.method === "initialize.error")).toHaveLength(1);
+    expect(messages.filter((message: any) => message.tool?.name?.startsWith("recovery:"))).toHaveLength(2);
+    expect(failovers).toEqual([expect.objectContaining({ threadId, from: expect.objectContaining(backup), to: expect.objectContaining(healthy) })]);
   });
 }, 90_000);
 
