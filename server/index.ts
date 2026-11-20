@@ -210,7 +210,7 @@ import {
   newId,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
-import { chosenBackups, type RecoveryAttempt, recoveryCapabilityError, refusalsAllow, startupBackups, untriedBackups } from "./automatic-recovery.ts"; import { outOfProcesses } from "./process-shortage.ts";
+import { chosenBackups, type RecoveryAttempt, startupBackups } from "./automatic-recovery.ts"; import { createRecoveryBackups } from "./host/recovery-backups.ts"; import { outOfProcesses } from "./process-shortage.ts";
 import { createQuotaSwitchHost } from "./host/quota-switch.ts"; import { quotaSwitchEnabled } from "./quota-switch.ts"; import { createPeerLimitResend } from "./host/peer-limit-resend.ts"; import { createRoomLimitTakeover } from "./host/room-limit-takeover.ts";
 import { decodeGeneratedImage } from "./generated-image.ts";
 import { createMcpServersHost } from "./host/mcp-servers-host.ts"; import { createMcpKeys } from "./vault/mcp-keys.ts"; import { createLimitTakeover, signedOutStop } from "./host/limit-takeover.ts";
@@ -2667,31 +2667,6 @@ function threadEngine(instanceId: string): ThreadEngine | undefined {
 
 /** Why a thread on `own` would run on the bot's model instead at turn start, or null when it runs as chosen. */
 function modelGivesWay(own: ModelSelection, botModel: ModelSelection) { return threadModelFallback(own, botModel, threadEngine, { refusal: policyModelRefusal, ...(hostedModels ? { allows: (selection: ModelSelection) => hostedModels!.allows(selection) } : {}) }); }
-
-type RecoveryScope = { current: BotRecord; threadId: string; from: Pick<ProviderInstance, "driverKind" | "adapter">; confined: boolean; attempts: readonly RecoveryAttempt[] };
-
-function recoveryRefusal(backup: Pick<ModelSelection, "instanceId" | "model">, on: RecoveryScope): string | undefined {
-  const checked = checkedModelSelection(backup, undefined, true), target = checked.ok ? registry.get(checked.selection.instanceId) : null;
-  if (!checked.ok) return checked.error;
-  if (!target?.enabled || !refusalsAllow(on.attempts, target, instanceConfigs(cfg)[target.instanceId])) return "The backup AI is unavailable.";
-  if (on.current.approvalGrant) return "Wait for the approval change to finish before switching models";
-  if (engineSwitchNeedsAsk(approvalModeFor(on.current), on.current.modelSelection, checked.selection)) return "Confirm switching this model with Ask permissions first (resetApprovalToAsk)";
-  const policy = policyModelRefusal(target);
-  if (policy || modelGivesWay(checked.selection, store.bot(on.current.id)?.modelSelection ?? on.current.modelSelection)) return policy ?? "The backup AI is unavailable.";
-  if (on.confined && target.adapter.capabilities.guestTurns !== "confined") return "The backup cannot take this confined turn.";
-  if (!store.taskByThread(on.current.id, on.threadId)?.cwd) return "This older thread has no pinned working folder. Choose its backup manually.";
-  return recoveryCapabilityError({ driverKind: on.from.driverKind, capabilities: on.from.adapter.capabilities }, { driverKind: target.driverKind, capabilities: target.adapter.capabilities });
-}
-
-function recoveryBackup<T extends Pick<ModelSelection, "instanceId" | "model">>(on: RecoveryScope, candidates: readonly T[]): { backup: T; selection: ModelSelection; target: ProviderInstance } | { refusal: string } {
-  let refusal: string | undefined;
-  for (const backup of candidates) {
-    const why = recoveryRefusal(backup, on), checked = why ? null : checkedTaskModelSwitch(on.current, backup, false, false, true);
-    if (checked?.ok) return { backup, selection: checked.selection, target: registry.get(checked.selection.instanceId)! };
-    refusal ??= why ?? (checked && !checked.ok ? checked.error : undefined);
-  }
-  return { refusal: refusal ?? "The backup AI is unavailable." };
-}
 
 function threadModelGivingWay(botId: string, threadId: string): ModelSelection | null {
   const bot = store.bot(botId);
@@ -8359,11 +8334,8 @@ async function beginTurn(
       handoffs.dispatching(threadId, dispatchClaimId, dispatchContext.handoff);
       const clock = takesTurnClock(userTurnText) ? turnClockLine(Date.now(), hostTimeZone()) + nearLimitNote(limitClock.limit(instanceId), engineName(instanceId), hostTimeZone()) : "";
       const shareNote = skillsHost.shareNote(bot, threadId, Boolean(privateWorkspace));
-      const tried = opts?.automaticRecoveryTried, project = store.projectBotForTask(bot.id, threadId);
-      const takes = (backup: Pick<ModelSelection, "instanceId" | "model">, attempts: RecoveryAttempt[]) => Boolean(project) && !recoveryRefusal(backup, { current: project!, threadId, from: instance, confined: guestConfined, attempts });
-      const startup = startupBackups(liveBot ?? bot, cfg.automaticRecovery), startupRecovery = Boolean(opts?.automaticRecoveryTried) || startup.length > 0; const posted = unreadThreadPosts(store.activePath(threadId)); // post_to_thread messages left here since its last run
-      const held = limitTakeover.heldAtStart(bot, { instanceId, model }, !tried ? startup.length > 0 : (scope) => !quotaSwitchEnabled() && untriedBackups(startup, { instanceId, model }, tried).some((backup) => takes(backup, [...tried, { instanceId, model, driverKind: instance.driverKind, why: scope }])),
-        undefined, (backup) => !tried || (untriedBackups([backup], { instanceId, model }, tried).length > 0 && takes(backup, tried))); // a limit or a sign-out already known: straight to an AI that can carry on, with the reset only when one was named
+      const project = store.projectBotForTask(bot.id, threadId), startup = startupBackups(liveBot ?? bot, cfg.automaticRecovery), startupRecovery = Boolean(opts?.automaticRecoveryTried) || startup.length > 0, weigh = recoveryBackups.hold(project ? { current: project, threadId, from: instance, model, confined: guestConfined } : null, startup, opts?.automaticRecoveryTried); const posted = unreadThreadPosts(store.activePath(threadId)); // post_to_thread messages left here since its last run
+      const held = limitTakeover.heldAtStart(bot, { instanceId, model }, weigh.recovering, undefined, weigh.counts); // a limit or a sign-out already known: straight to an AI that can carry on, with the reset only when one was named
       if (held) throw held.scope === "signed-out" ? Object.assign(new TurnAuthenticationRefusedError(`signed-out-${randomUUID()}`, `${engineName(instanceId)} is signed out.`, true), userErrorFields(userError("serverError.engine.signedOut", { name: engineName(instanceId) }))) : new TurnUsageLimitRefusedError(`limit-${randomUUID()}`, `${engineName(instanceId)} is at its usage limit.`, held.resetsAt, held.scope, true); perf.noteSetup(threadId, setup.done());
       const dispatch = await guardTurnDispatch(shareNote.after(savedSteps.dispatch.sendTurn(instance, personLine && !opts?.unattended && !opts?.app?.context && !guestConfined ? { botId: bot.id, message: userMessage, turnText: text, placePicked: wants === "local" && placeSource !== "auto-pin" } : null, {
         threadId,
@@ -8494,16 +8466,15 @@ async function beginTurn(
       const weighed = takeoverScope && current && quotaSwitchEnabled() ? limitTakeover.weighBackups(bot.id, current.modelSelection, takeoverScope, approvalModeFor(current)) : null; if (weighed && takeoverScope && current) limitTakeover.passedOver(current, current.modelSelection, takeoverScope, weighed.skipped);
       const backups = weighed ? weighed.backups : current ? startupBackups(current, cfg.automaticRecovery) : [];
       const attempts: RecoveryAttempt[] = [...(opts?.automaticRecoveryTried ?? []), { instanceId, model, driverKind: instance.driverKind, ...(takeoverScope ? { why: takeoverScope } : {}) }];
-      const candidates = untriedBackups(backups, { instanceId, model }, attempts).filter((candidate) => registry.get(candidate.instanceId)?.enabled &&
-        refusalsAllow(attempts, registry.get(candidate.instanceId)!, instanceConfigs(cfg)[candidate.instanceId]));
-      if (mayRecover && candidates.length > 0 && current && (!opts?.cardContinuation || opts.coordination) &&
+      const recovery = current && { current, threadId, from: instance, model, confined: guestConfined }, candidates = recovery ? recoveryBackups.candidates(backups, recovery, attempts) : [];
+      if (mayRecover && recovery && candidates.length > 0 && (!opts?.cardContinuation || opts.coordination) &&
           !directRequestOwners.get(threadId)?.stopped && !hasQueuedSteeredMessages(bot.id, threadId) &&
           JSON.stringify(current.modelSelection) === JSON.stringify(bot.modelSelection) &&
           store.activePath(threadId).findLast(m => m.role === "user" && m.kind === "text")?.id === recoveryUserMessageId) {
         // No await between releasing the failed attempt and admitting its replacement: a newer send or Stop must never lose to a stale retry.
         store.setTaskActivity(bot.id, threadId, "idle");
         directTurnBots.delete(threadId);
-        const picked = recoveryBackup({ current, threadId, from: instance, confined: guestConfined, attempts }, candidates);
+        const picked = recoveryBackups.pick(recovery, candidates, attempts);
         if ("target" in picked) {
           const { backup, selection, target } = picked;
           try {
@@ -8693,13 +8664,13 @@ async function stopBotForEmergencyApprovalDowngrade(botId: string): Promise<void
 const engineName = (engine: string) => engineLabel(engine, registry.get(engine) ?? undefined);
 const limitClock = new LimitResetClock({ file: join(DATA_DIR, "limit-holds.json"), accounts: () => planAccountsFromInstances(instanceConfigs(cfg)), onChange: () => routines?.retimeLimitResets(),
   waiting: () => Boolean(routines?.listRoutines().some((routine) => routine.enabled && routine.schedule.type === "limit_reset")) }); const limitTakeover = createLimitTakeover({ file: join(DATA_DIR, "limit-notices.json"), holdsFile: join(DATA_DIR, "limit-takeover-holds.json"), configs: () => instanceConfigs(cfg), context: selectionContext, blockedUntil: (engine, model) => limitClock.blockedUntil(engine, model), resetAt: (engine, model) => limitClock.resetAt(engine, model), meterOnly: (engine, model) => limitClock.meterOnly(engine, model), enabled: () => quotaSwitchEnabled(), where: CLOUD_HOME ? "on the Cloud" : "on this computer", signedOutNow: (id) => registry.knownSnapshot(id)?.authenticated === false, signedOutNoticed: () => registry.forgetSnapshots(), botsOn: (id) => store.bots.filter((bot) => !bot.hidden && bot.modelSelection.instanceId === id), engineName, engines: () => selectableInstances(registry.instances().map((engine) => ({ instanceId: engine.instanceId, driverKind: engine.driverKind, displayName: engine.displayName, enabled: engine.enabled, access: registry.access(engine.instanceId), models: engine.models, snapshot: registry.knownSnapshot(engine.instanceId) ?? { state: "unavailable" as const, reason: "not read yet" }, capabilities: engine.adapter.capabilities }))), chosen: (botId) => chosenBackups(store.bot(botId), cfg.automaticRecovery), signedOutChosen: (botId) => { const bot = store.bot(botId); return bot ? startupBackups(bot, cfg.automaticRecovery) : []; }, tell: (about, text) => notify(buildNoticeNotification(about, store.bot(about.id)?.threadId ?? "", text)), record: (failover) => { limitFailovers.record(failover); perf.noteFailover(failover.threadId, failover.why === "signed-out" ? "signed-out" : "limit"); } }); registry.onSignedIn((instanceId) => limitTakeover.signedIn(instanceId));
-const limitFailovers = new LimitFailovers({ file: join(DATA_DIR, "limit-failovers.json"), blockedUntil: (engine, model) => limitClock.blockedUntil(engine, model), signedOut: (engine) => limitTakeover.stillSignedOut(engine), signedOutNow: (engine) => registry.knownSnapshot(engine)?.authenticated === false, engineName,
+const limitFailovers = new LimitFailovers({ file: join(DATA_DIR, "limit-failovers.json"), blockedUntil: (engine, model) => limitClock.blockedUntil(engine, model), signedOut: (engine) => limitTakeover.stillSignedOut(engine), engineName,
   threadModel: (botId, threadId) => store.projectBotForTask(botId, threadId)?.modelSelection ?? null,
   note: (threadId, line, text) => store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: `recovery: ${line}`, ok: true, ...(text ? { nameCode: text.key, nameParams: text.params } : {}) } }),
   switchBack: ({ botId, threadId, from, to }) => {
     const current = store.projectBotForTask(botId, threadId), checked = current ? checkedTaskModelSwitch(current, from, false, false, true) : null;
     return Boolean(checked?.ok && store.switchTaskModel(botId, threadId, checked.selection, false, false, { ...hostedModels?.resetTask(to, checked.selection), rewound: true }));
-  } });
+  } }); const recoveryBackups = createRecoveryBackups({ engine: (id) => registry.get(id), store, configs: () => instanceConfigs(cfg), checkedSelection: (raw) => checkedModelSelection(raw, undefined, true), checkedSwitch: (current, raw) => checkedTaskModelSwitch(current, raw, false, false, true), switchNeedsAsk: (current, to) => engineSwitchNeedsAsk(approvalModeFor(current), current.modelSelection, to), policyRefusal: policyModelRefusal, givesWay: modelGivesWay, quotaSwitchEnabled });
 const automationDestinations = createAutomationDestinations({ store, mainThread: botMainThread, runs: () => routines?.listRuns() ?? [],
   cloud: CLOUD_HOME ? { owner: CLOUD_OWNER_KEY!, opener: (id, routine) => (routine && teamRoutines.opener(routine)) || routineOpener(id), reportFromOthers: cloudReportFromOthers, opened: (threadId, person) => threadStarters.set(threadId, person), outside: (threadId) => outsideLineage.mark(threadId) } : null });
 const routineModelChecks: RoutineModelChecks = { check: (raw) => checkedModelSelection(raw), bot: (botId) => store.bot(botId), engineSwitchNeedsAsk };

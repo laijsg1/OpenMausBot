@@ -34,7 +34,7 @@ describe("LimitFailovers", () => {
   afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
   const from = { instanceId: "claude", model: "claude-sonnet-5" };
   const to = { instanceId: "codex", model: "gpt-fake-default" };
-  function fixture(options: { blocked?: number | null; current?: typeof from | null; allowed?: boolean; signedOut?: () => boolean; signedOutNow?: () => boolean } = {}) {
+  function fixture(options: { blocked?: number | null; current?: typeof from | null; allowed?: boolean; signedOut?: () => boolean } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "omb-limit-failovers-"));
     dirs.push(dir);
     let now = NOW;
@@ -43,7 +43,7 @@ describe("LimitFailovers", () => {
     const switched: LimitFailover[] = [];
     const deps = {
       file: join(dir, "limit-failovers.json"), now: () => now,
-      blockedUntil: () => state.blocked, threadModel: () => state.current, signedOut: options.signedOut, signedOutNow: options.signedOutNow,
+      blockedUntil: () => state.blocked, threadModel: () => state.current, signedOut: options.signedOut,
       switchBack: (failover: LimitFailover) => { if (options.allowed === false) return false; switched.push(failover); state.current = failover.from; return true; },
       note: (_threadId: string, line: string) => notes.push(line), engineName: (engine: string) => engine === "claude" ? "Claude" : engine,
     };
@@ -134,13 +134,20 @@ describe("LimitFailovers", () => {
     expect(f.failovers.restore("scout", "t")).toBe(true);
   });
 
-  it("after a limit, waits while the engine's latest status says it is signed out, not for an old sign-out record", () => {
-    let now = true;
-    const f = fixture({ signedOut: () => true, signedOutNow: () => now });
-    f.failovers.record({ botId: "scout", threadId: "t", from, to, resetsAt: NOW + HOUR, at: NOW });
-    f.at(NOW + 2 * HOUR);
-    expect(f.failovers.restore("scout", "t")).toBe(false);
-    now = false;
+  it("waits for both a model's limit and a sign-in when that AI's other model then signed out too", () => {
+    let out = true;
+    const opus = { instanceId: "claude", model: "claude-opus-5" }, sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+    const f = fixture({ current: { instanceId: "grok", model: "grok-5" }, signedOut: () => out });
+    f.failovers.record({ botId: "scout", threadId: "t", from: opus, to: sonnet, resetsAt: NOW + 2 * HOUR, at: NOW });
+    f.failovers.record({ botId: "scout", threadId: "t", from: sonnet, to: { instanceId: "grok", model: "grok-5" }, resetsAt: null, at: NOW + 1, why: "signed-out" });
+    expect(f.failovers.list()).toEqual([expect.objectContaining({ from: opus, why: "signed-out", resetsAt: NOW + 2 * HOUR })]);
+    f.at(NOW + HOUR);
+    out = false;
+    expect(f.failovers.restore("scout", "t"), "the model's limit still holds").toBe(false);
+    f.at(NOW + 3 * HOUR);
+    out = true;
+    expect(f.failovers.restore("scout", "t"), "still signed out").toBe(false);
+    out = false;
     expect(f.failovers.restore("scout", "t")).toBe(true);
   });
 

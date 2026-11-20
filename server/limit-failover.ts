@@ -78,8 +78,6 @@ export interface LimitFailoverDeps {
   blockedUntil: (engine: string, model?: string) => number | null;
   /** This engine refused a turn because it is signed out, and has not been signed in again since. */
   signedOut?: (engine: string) => boolean;
-  /** The engine's latest status read says it is signed out. */
-  signedOutNow?: (engine: string) => boolean;
   /** The thread's model now, or null when the thread is gone. */
   threadModel: (botId: string, threadId: string) => ModelSelection | null;
   /** Switches the thread back; false when that is not allowed now (a busy thread, a permission change). */
@@ -115,7 +113,11 @@ export class LimitFailovers {
     // A reset already past when the limit refused names no time: the engine's own hold decides when it goes back.
     const resetsAt = failover.resetsAt !== null && failover.resetsAt > failover.at ? failover.resetsAt : null;
     // A second failover keeps the engine the conversation started on, so it still goes back there.
-    const row = earlier && sameModelSelection(earlier.to, failover.from) ? { ...earlier, to: failover.to } : { ...failover, resetsAt };
+    const chained = earlier && sameModelSelection(earlier.to, failover.from) ? earlier : undefined;
+    // The AI the conversation started on signed out too: it goes back once it is signed in and its own limit is over.
+    const signedOutToo = chained && chained.why !== "signed-out" && failover.why === "signed-out" && failover.from.instanceId === chained.from.instanceId;
+    const row = !chained ? { ...failover, resetsAt } : signedOutToo ? { ...chained, to: failover.to, why: "signed-out" as const, resetsAt: chained.resetsAt ?? chained.at + UNKNOWN_RESET_WAIT_MS }
+      : { ...chained, to: failover.to };
     this.rows = [...this.rows.filter((one) => one.threadId !== failover.threadId), row].slice(-500);
     this.save();
   }
@@ -136,9 +138,9 @@ export class LimitFailovers {
     const current = this.deps.threadModel(botId, threadId);
     if (!current || !sameModelSelection(current, row.to)) return this.forget(threadId);
     const blocked = this.deps.blockedUntil(row.from.instanceId, row.from.model) !== null;
-    const waitUntil = row.why === "signed-out" ? row.at : row.meter ? row.at : row.resetsAt ?? row.at + UNKNOWN_RESET_WAIT_MS;
+    const waitUntil = row.why === "signed-out" ? Math.max(row.at, row.resetsAt ?? 0) : row.meter ? row.at : row.resetsAt ?? row.at + UNKNOWN_RESET_WAIT_MS;
     if (waitUntil > now || blocked) return false;
-    if (row.why === "signed-out" ? this.deps.signedOut?.(row.from.instanceId) : this.deps.signedOutNow?.(row.from.instanceId)) return false;
+    if (row.why === "signed-out" && this.deps.signedOut?.(row.from.instanceId)) return false;
     if (!this.deps.switchBack(row)) return false;
     this.forget(threadId);
     this.deps.note(threadId, backLine(this.deps.engineName(row.from.instanceId), row.why), row.why === "signed-out" ? { key: "chat.notice.failoverSignedInAgain", params: { engine: this.deps.engineName(row.from.instanceId) } } : undefined);
