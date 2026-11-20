@@ -34,7 +34,7 @@ describe("LimitFailovers", () => {
   afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
   const from = { instanceId: "claude", model: "claude-sonnet-5" };
   const to = { instanceId: "codex", model: "gpt-fake-default" };
-  function fixture(options: { blocked?: number | null; current?: typeof from | null; allowed?: boolean; signedOut?: () => boolean } = {}) {
+  function fixture(options: { blocked?: number | null; current?: typeof from | null; allowed?: boolean; signedOut?: () => boolean; signedOutNow?: () => boolean } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "omb-limit-failovers-"));
     dirs.push(dir);
     let now = NOW;
@@ -43,7 +43,7 @@ describe("LimitFailovers", () => {
     const switched: LimitFailover[] = [];
     const deps = {
       file: join(dir, "limit-failovers.json"), now: () => now,
-      blockedUntil: () => state.blocked, threadModel: () => state.current, signedOut: options.signedOut,
+      blockedUntil: () => state.blocked, threadModel: () => state.current, signedOut: options.signedOut, signedOutNow: options.signedOutNow,
       switchBack: (failover: LimitFailover) => { if (options.allowed === false) return false; switched.push(failover); state.current = failover.from; return true; },
       note: (_threadId: string, line: string) => notes.push(line), engineName: (engine: string) => engine === "claude" ? "Claude" : engine,
     };
@@ -131,6 +131,16 @@ describe("LimitFailovers", () => {
     f.failovers.retarget("t", to, { instanceId: "grok", model: "grok-5" });
     expect(f.failovers.list()).toEqual([{ botId: "scout", threadId: "t", from, to: { instanceId: "grok", model: "grok-5" }, resetsAt: NOW + HOUR, at: NOW }]);
     f.at(NOW + 2 * HOUR);
+    expect(f.failovers.restore("scout", "t")).toBe(true);
+  });
+
+  it("after a limit, waits while the engine's latest status says it is signed out, not for an old sign-out record", () => {
+    let now = true;
+    const f = fixture({ signedOut: () => true, signedOutNow: () => now });
+    f.failovers.record({ botId: "scout", threadId: "t", from, to, resetsAt: NOW + HOUR, at: NOW });
+    f.at(NOW + 2 * HOUR);
+    expect(f.failovers.restore("scout", "t")).toBe(false);
+    now = false;
     expect(f.failovers.restore("scout", "t")).toBe(true);
   });
 

@@ -78,6 +78,8 @@ export interface LimitFailoverDeps {
   blockedUntil: (engine: string, model?: string) => number | null;
   /** This engine refused a turn because it is signed out, and has not been signed in again since. */
   signedOut?: (engine: string) => boolean;
+  /** The engine's latest status read says it is signed out. */
+  signedOutNow?: (engine: string) => boolean;
   /** The thread's model now, or null when the thread is gone. */
   threadModel: (botId: string, threadId: string) => ModelSelection | null;
   /** Switches the thread back; false when that is not allowed now (a busy thread, a permission change). */
@@ -136,7 +138,7 @@ export class LimitFailovers {
     const blocked = this.deps.blockedUntil(row.from.instanceId, row.from.model) !== null;
     const waitUntil = row.why === "signed-out" ? row.at : row.meter ? row.at : row.resetsAt ?? row.at + UNKNOWN_RESET_WAIT_MS;
     if (waitUntil > now || blocked) return false;
-    if (row.why === "signed-out" && this.deps.signedOut?.(row.from.instanceId)) return false;
+    if (row.why === "signed-out" ? this.deps.signedOut?.(row.from.instanceId) : this.deps.signedOutNow?.(row.from.instanceId)) return false;
     if (!this.deps.switchBack(row)) return false;
     this.forget(threadId);
     this.deps.note(threadId, backLine(this.deps.engineName(row.from.instanceId), row.why), row.why === "signed-out" ? { key: "chat.notice.failoverSignedInAgain", params: { engine: this.deps.engineName(row.from.instanceId) } } : undefined);
