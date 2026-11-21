@@ -70,13 +70,14 @@ describe("claudeCompactionDisabled", () => {
 describe("compactConversation", () => {
   const bot = { id: "bot" } as BotRecord;
   const thread = "thread";
-  function setup(options: { tokens: number; nativeCompaction?: boolean; engineCompactionOn?: boolean; engineCompact?: boolean; compactAt?: number;
-    generateText?: ConversationCompactionDeps["generateText"]; claimIsCurrent?: () => boolean }) {
+  function setup(options: { tokens: number; nativeCompaction?: boolean; engineCompactionOn?: boolean; engineCompact?: boolean | "stale"; compactAt?: number;
+    generateText?: ConversationCompactionDeps["generateText"]; claimIsCurrent?: () => boolean; resumes?: boolean }) {
     const messages: Message[] = ["one", "two", "three", "four"].flatMap((word, index) => [
       { id: `u${index}`, role: "user", kind: "text", text: `ask ${word}`, at: index * 2 } as Message,
       { id: `b${index}`, role: "bot", kind: "text", text: `answer ${word}`, at: index * 2 + 1 } as Message,
     ]);
     const asked: string[] = [];
+    const checks: Array<{ model: string; compactAtSet: boolean; resumes: boolean; current: boolean; selection: { instanceId: string; model: string | null } | undefined }> = [];
     const summarizing: boolean[] = [];
     const deps: ConversationCompactionDeps = {
       store: {
@@ -90,7 +91,13 @@ describe("compactConversation", () => {
       latestCompaction: () => undefined,
       nativeCompactTokens: () => 200_000,
       engineCompactionOn: () => options.engineCompactionOn ?? true,
-      engineCompact: async (target) => { asked.push(target.instanceId); return options.engineCompact ?? false; },
+      engineCompact: async (target, _signal, check) => {
+        asked.push(target.instanceId);
+        checks.push({ model: check.model, compactAtSet: check.compactAtSet, resumes: check.resumes("session-1"), current: check.current(), selection: check.selectionNow() });
+        return options.engineCompact === "stale" ? "stale" : options.engineCompact ? "done" : "skipped";
+      },
+      resumesSession: () => options.resumes ?? true,
+      currentSelection: () => ({ instanceId: "engine", model: "model" }),
       generateText: options.generateText ?? (() => undefined),
       claimIsCurrent: options.claimIsCurrent ?? (() => true),
       controllers: new Map(),
@@ -101,7 +108,7 @@ describe("compactConversation", () => {
     const instance = { instanceId: "engine", driverKind: "claudeAgent", adapter: { capabilities: { nativeCompaction: options.nativeCompaction ?? true } } };
     const run = (manual: boolean) => createConversationCompaction(deps)({ bot, threadId: thread, generation: "g", instance, model: "model", excludedIds: new Set(), manual });
     const folds = () => messages.filter((m) => m.kind === "compaction");
-    return { run, folds, asked, deps, summarizing };
+    return { run, folds, asked, checks, deps, summarizing };
   }
 
   it("writes no fold before a turn at 164k on an engine that compacts itself, and one on an engine that does not", async () => {
@@ -146,6 +153,22 @@ describe("compactConversation", () => {
     expect(fed.asked).toEqual([]);
     expect(fed.folds()).toHaveLength(1);
   });
+  it("asks the engine with what its compaction is checked against, and folds nothing when the engine compacted but the conversation moved on", async () => {
+    const stale = setup({ tokens: 50_000, engineCompact: "stale", resumes: false });
+    await stale.run(true);
+    expect(stale.asked).toEqual(["engine"]);
+    expect(stale.checks).toEqual([{ model: "model", compactAtSet: false, resumes: false, current: true, selection: { instanceId: "engine", model: "model" } }]);
+    expect(stale.folds()).toHaveLength(0);
+    expect(stale.summarizing).toEqual([]);
+    const gone = setup({ tokens: 50_000, engineCompact: "stale", claimIsCurrent: () => false });
+    await gone.run(true);
+    expect(gone.folds()).toHaveLength(0);
+    expect(gone.checks[0]).toMatchObject({ current: false });
+    const set = setup({ tokens: 50_000, compactAt: 3_000, engineCompact: "stale" });
+    await set.run(true);
+    expect(set.checks[0]).toMatchObject({ compactAtSet: true });
+  });
+
   it("says it is summarizing while a summary someone waits on is written, and clears it on every way out", async () => {
     const written = setup({ tokens: 50_000 });
     await written.run(true);
